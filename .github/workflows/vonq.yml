@@ -1,0 +1,60 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER_NAME: ${{ secrets.ECS_CLUSTER_NAME }}
+  ECS_SERVICE_NAME: ${{ secrets.ECS_SERVICE_NAME }}
+  ECS_TASK_DEFINITION_FAMILY: ${{ secrets.ECS_TASK_DEFINITION_FAMILY }}
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker images
+        run: |
+          TAG=${GITHUB_SHA::8}
+          docker build -t $ECR_REPOSITORY/django:${TAG} ./django
+          docker build -t $ECR_REPOSITORY/celery:${TAG} ./celery
+          docker build -t $ECR_REPOSITORY/nginx:${TAG} ./nginx
+          docker build -t $ECR_REPOSITORY/redis:${TAG} ./redis
+          docker build -t $ECR_REPOSITORY/traefik:${TAG} ./traefik
+
+          docker push $ECR_REPOSITORY/django:${TAG}
+          docker push $ECR_REPOSITORY/celery:${TAG}
+          docker push $ECR_REPOSITORY/nginx:${TAG}
+          docker push $ECR_REPOSITORY/redis:${TAG}
+          docker push $ECR_REPOSITORY/traefik:${TAG}
+
+      - name: Update ECS service
+        run: |
+          TASK_DEF=$(aws ecs register-task-definition \
+            --family $ECS_TASK_DEFINITION_FAMILY \
+            --cli-input-json file://ecs/task-def.json | jq -r '.taskDefinition.taskDefinitionArn')
+
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER_NAME \
+            --service $ECS_SERVICE_NAME \
+            --task-definition $TASK_DEF
