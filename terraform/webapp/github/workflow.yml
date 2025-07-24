@@ -1,0 +1,106 @@
+name: Build and Deploy to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - prod
+      aws_region:
+        description: 'AWS Region'
+        required: true
+        default: 'eu-west-1'
+        type: string
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  ECR_REPOSITORY_DJANGO: vonq-django-app
+  ECR_REPOSITORY_NGINX: vonq-nginx
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          
+      - name: Run tests
+        run: |
+          python manage.py test
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set environment variables
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+            echo "AWS_REGION=${{ github.event.inputs.aws_region }}" >> $GITHUB_ENV
+          elif [[ ${{ github.ref }} == 'refs/heads/main' ]]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "AWS_REGION=eu-west-1" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "AWS_REGION=eu-west-1" >> $GITHUB_ENV
+          fi
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHub-Vonq
+          role-session-name: GitHubActions
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build and push Django image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_DJANGO:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_DJANGO:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_DJANGO:$IMAGE_TAG $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_DJANGO:latest
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_DJANGO:latest
+      
+      - name: Build and push Nginx image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_NGINX:$IMAGE_TAG -f nginx/Dockerfile nginx/
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_NGINX:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_NGINX:$IMAGE_TAG $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_NGINX:latest
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-$ECR_REPOSITORY_NGINX:latest
+      
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ENVIRONMENT }}-vonq-cluster \
+            --service ${{ env.ENVIRONMENT }}-vonq-service \
+            --force-new-deployment
