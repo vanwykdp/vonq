@@ -1,0 +1,155 @@
+name: Build and Deploy to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - prod
+      aws_region:
+        description: 'AWS Region'
+        required: true
+        default: 'eu-west-1'
+        type: string
+      primary_region:
+        description: 'Is this the primary region?'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  ECR_REPOSITORY_DJANGO: vonq-django-app
+  ECR_REPOSITORY_NGINX: vonq-nginx
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          
+      - name: Run tests
+        run: |
+          python manage.py test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set environment variables
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+            echo "AWS_REGION=${{ github.event.inputs.aws_region }}" >> $GITHUB_ENV
+            echo "PRIMARY_REGION=${{ github.event.inputs.primary_region }}" >> $GITHUB_ENV
+          elif [[ ${{ github.ref }} == 'refs/heads/main' ]]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "AWS_REGION=eu-west-1" >> $GITHUB_ENV
+            echo "PRIMARY_REGION=true" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "AWS_REGION=eu-west-1" >> $GITHUB_ENV
+            echo "PRIMARY_REGION=true" >> $GITHUB_ENV
+          fi
+
+          # Set AWS Account ID based on environment
+          if [[ "$ENVIRONMENT" == "prod" ]]; then
+            echo "AWS_ACCOUNT_ID=${{ secrets.AWS_PROD_ACCOUNT_ID }}" >> $GITHUB_ENV
+          else
+            echo "AWS_ACCOUNT_ID=${{ secrets.AWS_DEV_ACCOUNT_ID }}" >> $GITHUB_ENV
+          fi
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GitHub-Vonq
+          role-session-name: GitHubActions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Deploy Network Infrastructure
+        run: |
+          cd terraform/network
+          terraform init
+          terraform workspace select ${{ env.ENVIRONMENT }} || terraform workspace new ${{ env.ENVIRONMENT }}
+          terraform plan -var-file="input-variables-${{ env.ENVIRONMENT }}.tfvars"
+          terraform apply -auto-approve -var-file="input-variables-${{ env.ENVIRONMENT }}.tfvars"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build and push Django image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_DJANGO }}:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_DJANGO }}:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_DJANGO }}:$IMAGE_TAG $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_DJANGO }}:latest
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_DJANGO }}:latest
+      
+      - name: Build and push Nginx image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG -f nginx/Dockerfile nginx/
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_NGINX }}:latest
+          docker push $ECR_REGISTRY/${{ env.ENVIRONMENT }}-${{ env.ECR_REPOSITORY_NGINX }}:latest
+
+      - name: Deploy Application Infrastructure
+        run: |
+          cd terraform/webapp
+          terraform init
+          terraform workspace select ${{ env.ENVIRONMENT }} || terraform workspace new ${{ env.ENVIRONMENT }}
+          terraform plan \
+            -var="primary_region=${{ env.PRIMARY_REGION }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var-file="input-variables-${{ env.ENVIRONMENT }}.tfvars"
+          terraform apply -auto-approve \
+            -var="primary_region=${{ env.PRIMARY_REGION }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var-file="input-variables-${{ env.ENVIRONMENT }}.tfvars"
+      
+      - name: Update ECS Services
+        run: |
+          # Update Django app service
+          aws ecs update-service \
+            --cluster ${{ env.ENVIRONMENT }}-vonq-cluster \
+            --service ${{ env.ENVIRONMENT }}-vonq-service \
+            --force-new-deployment
+          
+          # Update data service
+          aws ecs update-service \
+            --cluster ${{ env.ENVIRONMENT }}-vonq-cluster \
+            --service ${{ env.ENVIRONMENT }}-vonq-data \
+            --force-new-deployment
